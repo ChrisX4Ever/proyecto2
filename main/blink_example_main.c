@@ -27,7 +27,7 @@
 #define ESP_SLAVE_ADDR               0x68
 
 // sampling default (Fodr) (se usa para configurar BMI)
-static uint32_t Fodr = 400; // valor inicial
+static uint32_t Fodr = 100; // valor inicial
 
 // Prototipos (asumo tus funciones bmi_read/bmi_write/bmi_init tal como definiste)
 extern esp_err_t bmi_read(uint8_t *data_address, uint8_t *data_rd, size_t size);
