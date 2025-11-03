@@ -1,0 +1,1 @@
+. /home/chris/esp/v5.5/esp-idf/export.sh
