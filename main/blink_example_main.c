@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
+#include "bmi270.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -352,7 +353,7 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_init_sta());
 
     // Inicializar BMI (usa tu bmi_init)
-    ESP_ERROR_CHECK(bmi_init());
+    bmi_sensor_init();
     // Aquí asumo que haces softreset, chipid, initialization, etc.
     // Llamar a tus funciones si están disponibles externamente:
     // softreset(); chipid(); initialization(); check_initialization(); bmipowermode(); internal_status();
