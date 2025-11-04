@@ -697,7 +697,5 @@ void bmi_sensor_init(void)
     check_initialization();
     bmipowermode();
     internal_status();    
-    printf("Comienza lectura\n\n");
-    lectura();
-    
+    printf("Sensor BMI270 inicializado correctamente\n\n");
 }
