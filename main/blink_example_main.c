@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -36,12 +38,13 @@ extern esp_err_t bmi_write(uint8_t *data_address, uint8_t *data_wr, size_t size)
 extern esp_err_t bmi_init(void);
 
 // --- Configuración WiFi / TCP Server (ajustar) ---
-#define WIFI_SSID       "Sala de Estudios DIE"
-#define WIFI_PASS       "SE.die2025"
-#define SERVER_IP       "192.168.50.82"   // IP de la Raspberry Pi (ajusta)
+#define WIFI_SSID       "LAB.SISTEMAS DE COMUNICACIONES"
+#define WIFI_PASS       "Comunicaciones"
+#define SERVER_IP       "192.168.0.207"   // IP de la Raspberry Pi (ajusta)
 #define SERVER_PORT     1111
 
-static const char *TAG = "BMI_TCP";
+static const char *TAG_T = "BMI_TCP";
+static const char *TAG_U = "BMI_UDP";
 
 // estado global protegido
 static int sockfd = -1;
@@ -60,7 +63,7 @@ static void handle_command(const char *cmd);
 // Implementación WiFi (modo station básico)
 static void wifi_reconnect_task(void *arg)
 {
-    ESP_LOGI(TAG, "Reconectando WiFi...");
+    ESP_LOGI(TAG_T, "Reconectando WiFi...");
     esp_wifi_connect();
     vTaskDelete(NULL);
 }
@@ -71,11 +74,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         xTaskCreate(wifi_reconnect_task, "wifi_reconnect_task", 4096, NULL, 5, NULL);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "WiFi desconectado, creando tarea de reconexión...");
+        ESP_LOGI(TAG_T, "WiFi desconectado, creando tarea de reconexión...");
         xTaskCreate(wifi_reconnect_task, "wifi_reconnect_task", 4096, NULL, 5, NULL);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Obtuvo IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG_T, "Obtuvo IP: " IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -107,7 +110,7 @@ static esp_err_t wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi inicializado en modo STA");
+    ESP_LOGI(TAG_T, "WiFi inicializado en modo STA");
     return ESP_OK;
 }
 
@@ -125,7 +128,7 @@ static esp_err_t send_all(const char *buf, size_t len)
     while (total < (ssize_t)len) {
         ssize_t sent = send(sockfd, buf + total, len - total, 0);
         if (sent < 0) {
-            ESP_LOGW(TAG, "send() falló");
+            ESP_LOGW(TAG_T, "send() falló");
             xSemaphoreGive(sock_mutex);
             return ESP_FAIL;
         }
@@ -145,17 +148,17 @@ static void tcp_client_task(void *arg)
     dest_addr.sin_port = htons(SERVER_PORT);
 
     while (1) {
-        ESP_LOGI(TAG, "Intentando conectar a %s:%d ...", SERVER_IP, SERVER_PORT);
+        ESP_LOGI(TAG_T, "Intentando conectar a %s:%d ...", SERVER_IP, SERVER_PORT);
         int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (s < 0) {
-            ESP_LOGE(TAG, "No se pudo crear socket");
+            ESP_LOGE(TAG_T, "No se pudo crear socket");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
         // conectar
         if (connect(s, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
-            ESP_LOGW(TAG, "connect falla, reintentando");
+            ESP_LOGW(TAG_T, "connect falla, reintentando");
             close(s);
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -166,12 +169,12 @@ static void tcp_client_task(void *arg)
         sockfd = s;
         tcp_connected = true;
         xSemaphoreGive(sock_mutex);
-        ESP_LOGI(TAG, "Conectado al servidor TCP.");
+        ESP_LOGI(TAG_T, "Conectado al servidor TCP.");
         // si estamos conectados pero sending==false -> estado "conexión pero sin transmisión"
         if (!sending) {
-            ESP_LOGI(TAG, "Conexión establecida pero sin transmisión (esperando START).");
+            ESP_LOGI(TAG_T, "Conexión establecida pero sin transmisión (esperando START).");
         } else {
-            ESP_LOGI(TAG, "Conexión y transmisión activa.");
+            ESP_LOGI(TAG_T, "Conexión y transmisión activa.");
         }
 
         // loop de lectura de comandos: usar recv con timeout
@@ -185,7 +188,7 @@ static void tcp_client_task(void *arg)
             ssize_t r = recv(s, rxbuf, sizeof(rxbuf)-1, 0);
             if (r > 0) {
                 rxbuf[r] = '\0';
-                ESP_LOGI(TAG, "Recibido comando: %s", rxbuf);
+                ESP_LOGI(TAG_T, "Recibido comando: %s", rxbuf);
                 // puede venir con saltos de línea, recorre por líneas
                 char *saveptr = NULL;
                 char *line = strtok_r(rxbuf, "\r\n", &saveptr);
@@ -194,7 +197,7 @@ static void tcp_client_task(void *arg)
                     line = strtok_r(NULL, "\r\n", &saveptr);
                 }
             } else if (r == 0) {
-                ESP_LOGW(TAG, "Servidor cerró conexión");
+                ESP_LOGW(TAG_T, "Servidor cerró conexión");
                 break;
             } else {
                 // r < 0, timeout o error
@@ -214,7 +217,7 @@ static void tcp_client_task(void *arg)
         tcp_connected = false;
         xSemaphoreGive(sock_mutex);
         sending = false; // preferible forzar stop al perder conexión
-        ESP_LOGW(TAG, "Desconectado. Reintentando en 2s...");
+        ESP_LOGW(TAG_T, "Desconectado. Reintentando en 2s...");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -229,7 +232,7 @@ static void handle_command(const char *cmd)
         int val = atoi(cmd + 6);
         if (val == 100 || val == 400 || val == 1600) {
             Fodr = val;
-            ESP_LOGI(TAG, "Frequencia muestreo cambiada a %d Hz", Fodr);
+            ESP_LOGI(TAG_T, "Frequencia muestreo cambiada a %d Hz", Fodr);
             // re-configurar BMI si ya inicializado: llamar función que configura registro acc_conf
             // enviar ack
             send_all("SRATE_OK\n", strlen("SRATE_OK\n"));
@@ -238,16 +241,16 @@ static void handle_command(const char *cmd)
         }
     } else if (strcmp(cmd, "START") == 0) {
         sending = true;
-        ESP_LOGI(TAG, "START recibido: comenzando transmisión de datos");
+        ESP_LOGI(TAG_T, "START recibido: comenzando transmisión de datos");
         send_all("STARTED\n", strlen("STARTED\n"));
     } else if (strcmp(cmd, "STOP") == 0) {
         sending = false;
-        ESP_LOGI(TAG, "STOP recibido: deteniendo transmisión de datos (pero manteniendo conexión)");
+        ESP_LOGI(TAG_T, "STOP recibido: deteniendo transmisión de datos (pero manteniendo conexión)");
         send_all("STOPPED\n", strlen("STOPPED\n"));
     } else if (strcmp(cmd, "PING") == 0) {
         send_all("PONG\n", strlen("PONG\n"));
     } else {
-        ESP_LOGI(TAG, "Comando desconocido: %s", cmd);
+        ESP_LOGI(TAG_T, "Comando desconocido: %s", cmd);
         send_all("UNK_CMD\n", strlen("UNK_CMD\n"));
     }
 }
@@ -261,7 +264,7 @@ static void sensor_task(void *arg)
     while (1) {
         if (!tcp_connected) {
             // no hay conexión: esperar y luego reintentar sin reiniciar
-            ESP_LOGI(TAG, "Sensor: sin conexión TCP, esperando reconexión...");
+            ESP_LOGI(TAG_T, "Sensor: sin conexión TCP, esperando reconexión...");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -279,7 +282,7 @@ static void sensor_task(void *arg)
         uint8_t data_data8[12];
         esp_err_t r = bmi_read(&reg_data, data_data8, 12);
         if (r != ESP_OK) {
-            ESP_LOGW(TAG, "Error leyendo BMI: %s", esp_err_to_name(r));
+            ESP_LOGW(TAG_T, "Error leyendo BMI: %s", esp_err_to_name(r));
             // si error en lectura, esperar y seguir
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -315,7 +318,7 @@ static void sensor_task(void *arg)
 
         // enviar por TCP
         if (send_all(outbuf, n) != ESP_OK) {
-            ESP_LOGW(TAG, "Falló envío de muestra, marcando como desconectado");
+            ESP_LOGW(TAG_T, "Falló envío de muestra, marcando como desconectado");
             // forzar cierre de socket para que task de tcp_client reintente
             xSemaphoreTake(sock_mutex, portMAX_DELAY);
             if (sockfd >= 0) close(sockfd);
@@ -326,7 +329,7 @@ static void sensor_task(void *arg)
             continue;
         } else {
             // informe de envío correcto (puedes moderar la verbosidad)
-            ESP_LOGI(TAG, "Muestra enviada ts=%" PRId64, t_ms);
+            ESP_LOGI(TAG_T, "Muestra enviada ts=%" PRId64, t_ms);
         }
 
         // esperar intervalo según Fodr
@@ -344,7 +347,7 @@ static void sensor_task(void *arg)
 // app_main: inicializa WiFi, BMI, crea tareas
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Iniciando...");
+    ESP_LOGI(TAG_T, "Iniciando...");
 
     // mutex para proteger sockfd
     sock_mutex = xSemaphoreCreateMutex();
@@ -363,5 +366,5 @@ void app_main(void)
     xTaskCreate(tcp_client_task, "tcp_client_task", 8 * 1024, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor_task", 8 * 1024, NULL, 6, NULL);
 
-    ESP_LOGI(TAG, "Tareas creadas.");
+    ESP_LOGI(TAG_T, "Tareas creadas.");
 }
