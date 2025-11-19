@@ -1,4 +1,4 @@
-idf_component_register(SRCS "blink_example_main.c" "bmi270.c"
+idf_component_register(SRCS "udp_client.c" "blink_example_main.c" "bmi270.c" "wifi_init.c"
                        INCLUDE_DIRS "."
                        REQUIRES
                            driver

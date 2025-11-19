@@ -6,6 +6,7 @@
 #include "math.h"
 #include "esp_task.h"
 #include <string.h>
+#include "bmi270.h"
 
 #define I2C_MASTER_SCL_IO				GPIO_NUM_47				//GPIO pin
 #define I2C_MASTER_SDA_IO				GPIO_NUM_48				//GPIO pin
@@ -661,6 +662,49 @@ void lectura(void)
         }
     }
 
+}
+
+bmi_data_t bmi_read_accel(void)
+{
+    bmi_data_t data = {0};
+    uint8_t reg_data = 0x0C;
+    uint8_t buffer[12];
+    esp_err_t ret;
+
+    ret = bmi_read(&reg_data, buffer, sizeof(buffer));
+    if (ret != ESP_OK) {
+        printf("Error al leer BMI270: %s\n", esp_err_to_name(ret));
+        return data;
+    }
+
+    int16_t acc_x_raw = ((int16_t)buffer[1] << 8) | buffer[0];
+    int16_t acc_y_raw = ((int16_t)buffer[3] << 8) | buffer[2];
+    int16_t acc_z_raw = ((int16_t)buffer[5] << 8) | buffer[4];
+    int16_t gyr_x_raw = ((int16_t)buffer[7] << 8) | buffer[6];
+    int16_t gyr_y_raw = ((int16_t)buffer[9] << 8) | buffer[8];
+    int16_t gyr_z_raw = ((int16_t)buffer[11] << 8) | buffer[10];
+
+    // Conversiones según tus factores previos en lectura()
+    data.ax = acc_x_raw * (8.000 / 32768.0);      // g
+    data.ay = acc_y_raw * (8.000 / 32768.0);
+    data.az = acc_z_raw * (8.000 / 32768.0);
+    data.gx = gyr_x_raw * (34.90659 / 32768.0);   // rad/s
+    data.gy = gyr_y_raw * (34.90659 / 32768.0);
+    data.gz = gyr_z_raw * (34.90659 / 32768.0);
+
+    return data;
+}
+
+bmi_data_t bmi_read_accel_gyro(void) {
+    bmi_data_t data;
+    // Ejemplo: lectura simulada, reemplaza con tu código I2C real
+    data.ax = 0.0f;
+    data.ay = 0.0f;
+    data.az = 0.0f;
+    data.gx = 0.0f;
+    data.gy = 0.0f;
+    data.gz = 0.0f;
+    return data;
 }
 
 void bmipowermode(void)

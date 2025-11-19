@@ -16,5 +16,10 @@
     "--query-driver=/home/chris/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc",
     "--compile-commands-dir=${workspaceFolder}/build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "files.associations": {
+    "i2c_master.h": "c",
+    "freertos.h": "c",
+    "esp_event.h": "c"
+  }
 }
