@@ -32,10 +32,15 @@ typedef enum {
     MODE_UDP = 1
 } connection_mode_t;
 
+// estado global protegido
 static connection_mode_t current_mode = MODE_TCP;
-static int udp_sock = -1;
-//static struct sockaddr_in udp_addr;
-static struct sockaddr_in udp_target_addr;
+static int sockfd = -1;             // Socket para TCP
+static int udp_sock = -1;           // Socket para UDP
+static struct sockaddr_in udp_target_addr; // Dirección de destino para UDP
+
+static SemaphoreHandle_t sock_mutex;
+static volatile bool tcp_connected = false;
+static volatile bool sending = false; // true=transmitir muestras, false=conectado pero sin transmitir
 
 // sampling default (Fodr) (se usa para configurar BMI)
 static uint32_t Fodr = 100; // valor inicial
@@ -44,31 +49,25 @@ static uint32_t Fodr = 100; // valor inicial
 extern esp_err_t bmi_read(uint8_t *data_address, uint8_t *data_rd, size_t size);
 extern esp_err_t bmi_write(uint8_t *data_address, uint8_t *data_wr, size_t size);
 extern esp_err_t bmi_init(void);
+extern void bmi_sensor_init(void); // Asumo que esta llama a bmi_init() y setup
 
-// --- Configuración WiFi / TCP Server (ajustar) ---
-#define WIFI_SSID       "JVidal"
-#define WIFI_PASS       "v1d1ls1lv1"
-#define SERVER_IP       "192.168.4.183"   // IP de la Raspberry Pi (ajusta)
-//#define SERVER_PORT     1111
-#define TCP_PORT      1111              // ← Cambia si usas otro
-#define UDP_PORT      3333              // ← Cambia si usas otro
+// --- Configuración WiFi / Server ---
+#define WIFI_SSID       "Sala de Estudios DIE"
+#define WIFI_PASS       "SE.die2025"
+#define SERVER_IP       "192.168.50.81"   // IP de la Raspberry Pi (ajusta)
+#define TCP_PORT        1111              // Puerto TCP
+#define UDP_PORT        3333              // Puerto UDP
 
 static const char *TAG1 = "BMI_TCP";
 static const char *TAG2 = "BMI_UDP";
 
-// estado global protegido
-static int sockfd = -1;
-static SemaphoreHandle_t sock_mutex;
-static volatile bool tcp_connected = false;
-static volatile bool sending = false; // true=transmitir muestras, false=conectado pero sin transmitir
-
-// Helpers
+// Prototipos (actualizados)
 static esp_err_t wifi_init_sta(void);
-static void udp_start();
-static void tcp_client_task(void *arg);
+static void connection_handler_task(void *arg); // Antes tcp_client_task
 static void sensor_task(void *arg);
 static esp_err_t send_all(const char *buf, size_t len);
 static void handle_command(const char *cmd);
+
 
 // -----------------------------------------------------------------------------
 // Implementación WiFi (modo station básico)
@@ -86,6 +85,14 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         xTaskCreate(wifi_reconnect_task, "wifi_reconnect_task", 4096, NULL, 5, NULL);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG1, "WiFi desconectado, creando tarea de reconexión...");
+        // Asegurar que el estado TCP se limpie
+        xSemaphoreTake(sock_mutex, portMAX_DELAY);
+        if (sockfd >= 0) close(sockfd);
+        sockfd = -1;
+        tcp_connected = false;
+        sending = false;
+        xSemaphoreGive(sock_mutex);
+        
         xTaskCreate(wifi_reconnect_task, "wifi_reconnect_task", 4096, NULL, 5, NULL);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
@@ -125,161 +132,103 @@ static esp_err_t wifi_init_sta(void)
     return ESP_OK;
 }
 
-static esp_err_t start_tcp_mode(void)
+// -----------------------------------------------------------------------------
+// Tarea de Conexión y Manejo de Comandos (TCP y UDP Init)
+static void connection_handler_task(void *arg)
 {
-    ESP_LOGI(TAG1, "Starting TCP mode...");
-
-    int sock;
-    struct sockaddr_in dest_addr;
-
-    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);   // ← IP de tu Raspberry
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(TCP_PORT);
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG1, "Unable to create TCP socket: errno %d", errno);
-        return ESP_FAIL;
+    // Inicializar socket UDP desde el principio
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (udp_sock < 0) {
+        ESP_LOGE(TAG2, "No se pudo crear socket UDP al iniciar: errno %d", errno);
+        vTaskDelete(NULL); // Fallo crítico
+        return;
     }
+    memset(&udp_target_addr, 0, sizeof(udp_target_addr));
+    udp_target_addr.sin_family = AF_INET;
+    udp_target_addr.sin_port = htons(UDP_PORT);
+    udp_target_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    ESP_LOGI(TAG2, "Socket UDP listo y apuntando a Raspberry: %s:%d", SERVER_IP, UDP_PORT);
 
-    ESP_LOGI(TAG1, "Connecting to TCP %s:%d ...", SERVER_IP, TCP_PORT);
 
-    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err != 0) {
-        ESP_LOGE(TAG1, "TCP connection failed: errno %d", errno);
-        close(sock);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG1, "TCP connected.");
-
-    // --- Timeout de recepción para evitar watchdog ---
-    struct timeval tv = {
-        .tv_sec = 1,
-        .tv_usec = 0
-    };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    // ----------- LOOP PRINCIPAL TCP -----------
     while (1) {
-
-        char rx_buffer[64];
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer)-1, 0);
-
-        if (len < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                // Recv timeout → cede tiempo al CPU
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            ESP_LOGE(TAG1, "TCP recv failed: errno %d", errno);
-            break;
-        }
-
-        if (len == 0) {
-            ESP_LOGW(TAG1, "TCP connection closed by server.");
-            break;
-        }
-
-        // Null terminator
-        rx_buffer[len] = 0;
-        ESP_LOGI(TAG1, "TCP received: %s", rx_buffer);
-
-        // Interpretar comando "TCP" o "UDP"
-        handle_command(rx_buffer);
-
-        // --- Cambio dinámico a UDP ---
-        if (current_mode == MODE_UDP) {
-            ESP_LOGI(TAG1, "Switching from TCP → UDP...");
-            close(sock);
-            return ESP_OK;
-        }
-
-        // ======================================
-        // Aquí agregas tu código TCP de envío:
-        // send(sock, data, length, 0);
-        // ======================================
-    }
-
-    close(sock);
-    return ESP_FAIL;
-}
-
-static esp_err_t start_udp_mode(void)
-{
-    ESP_LOGI(TAG2, "Starting UDP mode...");
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG2, "Unable to create UDP socket: errno %d", errno);
-        return ESP_FAIL;
-    }
-
-    // Dirección de destino (Raspberry Pi)
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(UDP_PORT);
-
-    // Timeout para evitar watchdog
-    struct timeval tv = {
-        .tv_sec = 1,
-        .tv_usec = 0
-    };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    ESP_LOGI(TAG2, "UDP socket ready. Sending to %s:%d",
-             SERVER_IP, UDP_PORT);
-
-    // Estos se usan en recvfrom()
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-
-    // ----------- LOOP PRINCIPAL UDP -----------
-    while (1) {
-
-        char rx_buffer[64];
-
-        int len = recvfrom(sock,
-                           rx_buffer,
-                           sizeof(rx_buffer)-1,
-                           0,
-                           (struct sockaddr *)&client_addr,
-                           &addr_len);
-
-        if (len < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            ESP_LOGE(TAG2, "UDP recvfrom error: %d", errno);
-            break;
-        }
-
-        rx_buffer[len] = 0;
-        ESP_LOGI(TAG2, "UDP received: %s", rx_buffer);
-
-        handle_command(rx_buffer);
-
-        // --- Cambio dinámico a TCP ---
         if (current_mode == MODE_TCP) {
-            ESP_LOGI(TAG2, "Switching from UDP → TCP...");
-            close(sock);
-            return ESP_OK;
+            // --- Lógica de Conexión y Recepción TCP ---
+            struct sockaddr_in dest_addr;
+            dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+            dest_addr.sin_family = AF_INET;
+            dest_addr.sin_port = htons(TCP_PORT);
+
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+            if (s < 0) {
+                ESP_LOGE(TAG1, "Error al crear socket TCP: errno %d", errno);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+
+            ESP_LOGI(TAG1, "Intentando conectar TCP a %s:%d...", SERVER_IP, TCP_PORT);
+            if (connect(s, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
+                ESP_LOGE(TAG1, "Fallo al conectar TCP: errno %d", errno);
+                close(s);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+
+            // Conexión exitosa, actualizar globales
+            xSemaphoreTake(sock_mutex, portMAX_DELAY);
+            sockfd = s;
+            tcp_connected = true;
+            xSemaphoreGive(sock_mutex);
+
+            ESP_LOGI(TAG1, "TCP conectado. Esperando comandos...");
+
+            // --- Bucle de Recepción de Comandos TCP ---
+            char rxbuf[128];
+            while (current_mode == MODE_TCP) {
+                // Timeout de 1 segundo para no bloquear indefinidamente
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                ssize_t r = recv(s, rxbuf, sizeof(rxbuf) - 1, 0);
+
+                if (r > 0) {
+                    rxbuf[r] = '\0';
+                    // --- LÍNEA DE DEBUG ---
+                    ESP_LOGI(TAG1, "Dato recibido RAW: '%s'", rxbuf); 
+                    // -----------------------------------
+                    char *line, *saveptr=NULL;
+                    line = strtok_r(rxbuf, "\r\n", &saveptr);
+                    while (line) {
+                        handle_command(line);
+                        line = strtok_r(NULL, "\r\n", &saveptr);
+                    }
+                } else if (r == 0) {
+                    ESP_LOGW(TAG1, "Conexión TCP cerrada por el servidor.");
+                    break;
+                } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                    ESP_LOGE(TAG1, "Error en recv TCP: errno %d", errno);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10)); // Pequeño delay para ceder tiempo
+            }
+
+            // Cierre de socket y limpieza de estado
+            ESP_LOGW(TAG1, "Saliendo de modo TCP…");
+            xSemaphoreTake(sock_mutex, portMAX_DELAY);
+            if (sockfd >= 0) close(sockfd);
+            sockfd = -1;
+            tcp_connected = false;
+            sending = false; // Parar el envío de datos al perder conexión
+            xSemaphoreGive(sock_mutex);
+        } else {
+            // Modo UDP: esta tarea solo espera
+            ESP_LOGI(TAG2, "Modo UDP activo. Enviando datos (si 'sending' es true).");
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-
-        // ======================================
-        // Aquí agregas tu código UDP de envío:
-        // sendto(sock, data, length, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-        // ======================================
     }
-
-    close(sock);
-    return ESP_FAIL;
 }
 
 // -----------------------------------------------------------------------------
-// Enviar todo (asegurar que se envía completo)
+// Enviar todo (Unificado para TCP/UDP)
 static esp_err_t send_all(const char *buf, size_t len)
 {
     if (current_mode == MODE_TCP) {
@@ -296,6 +245,7 @@ static esp_err_t send_all(const char *buf, size_t len)
 
     else if (current_mode == MODE_UDP) {
         if (udp_sock < 0) return ESP_FAIL;
+        // La dirección de destino ya está configurada en udp_target_addr
         ssize_t r = sendto(udp_sock, buf, len, 0,
                            (struct sockaddr*)&udp_target_addr,
                            sizeof(udp_target_addr));
@@ -306,100 +256,7 @@ static esp_err_t send_all(const char *buf, size_t len)
 }
 
 // -----------------------------------------------------------------------------
-
-static void udp_start()
-{
-    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (udp_sock < 0) {
-        ESP_LOGE(TAG2, "No se pudo crear socket UDP");
-        return;
-    }
-
-    memset(&udp_target_addr, 0, sizeof(udp_target_addr));
-    udp_target_addr.sin_family = AF_INET;
-    udp_target_addr.sin_port = htons(UDP_PORT);
-    udp_target_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-    ESP_LOGI(TAG2, "Modo UDP listo y apuntando a Raspberry: %s:%d",
-             SERVER_IP, UDP_PORT);
-}
-
-// Tarea TCP: conecta y atiende comandos entrantes
-static void tcp_client_task(void *arg)
-{
-    while (1) {
-        if (current_mode == MODE_TCP) {
-            ESP_LOGI(TAG1, "Entrando en modo TCP…");
-
-            struct sockaddr_in dest_addr;
-            dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-            dest_addr.sin_family = AF_INET;
-            dest_addr.sin_port = htons(TCP_PORT);
-
-            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-            if (s < 0) {
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                continue;
-            }
-
-            if (connect(s, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
-                close(s);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                continue;
-            }
-
-            xSemaphoreTake(sock_mutex, portMAX_DELAY);
-            sockfd = s;
-            tcp_connected = true;
-            xSemaphoreGive(sock_mutex);
-
-            ESP_LOGI(TAG1, "TCP conectado. Esperando comandos...");
-
-            char rxbuf[128];
-            while (current_mode == MODE_TCP) {
-                ssize_t r = recv(s, rxbuf, sizeof(rxbuf) - 1, 0);
-                if (r > 0) {
-                    rxbuf[r] = '\0';
-                    char *line, *saveptr=NULL;
-                    line = strtok_r(rxbuf, "\r\n", &saveptr);
-                    while (line) {
-                        handle_command(line);
-                        line = strtok_r(NULL, "\r\n", &saveptr);
-                    }
-                } else if (r == 0) break;
-            }
-
-            ESP_LOGW(TAG1, "Saliendo de TCP…");
-            xSemaphoreTake(sock_mutex, portMAX_DELAY);
-            if (sockfd >= 0) close(sockfd);
-            sockfd = -1;
-            tcp_connected = false;
-            xSemaphoreGive(sock_mutex);
-        }
-
-        else if (current_mode == MODE_UDP) {
-            ESP_LOGI(TAG2, "Entrando en modo UDP…");
-            udp_start();
-
-            while (current_mode == MODE_UDP) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                // UDP no recibe comandos, solo envía.
-                // Comandos solo llegan después cuando Raspberry vuelva a conectar TCP.
-            }
-
-            ESP_LOGW(TAG2, "Saliendo del modo UDP…");
-            if (udp_sock >= 0) {
-                close(udp_sock);
-                udp_sock = -1;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Manejo de comandos recibidos desde Raspberry Pi
+// Manejo de comandos recibidos desde Raspberry Pi (Solo vía TCP)
 static void handle_command(const char *cmd)
 {
     if (cmd == NULL) return;
@@ -409,80 +266,82 @@ static void handle_command(const char *cmd)
         if (val == 100 || val == 400 || val == 1600) {
             Fodr = val;
             ESP_LOGI(TAG1, "Frequencia muestreo cambiada a %d Hz", Fodr);
-            // re-configurar BMI si ya inicializado: llamar función que configura registro acc_conf
-            // enviar ack
+            // Aquí iría tu lógica para reconfigurar el registro acc_conf del BMI
             send_all("SRATE_OK\n", strlen("SRATE_OK\n"));
         } else {
             send_all("SRATE_ERR\n", strlen("SRATE_ERR\n"));
         }
     } else if (strcmp(cmd, "START") == 0) {
-        sending = true;
-        ESP_LOGI(TAG1, "START recibido: comenzando transmisión de datos");
-        send_all("STARTED\n", strlen("STARTED\n"));
+        // Solo inicia si el canal actual está activo
+        bool can_start = (current_mode == MODE_TCP && tcp_connected) || (current_mode == MODE_UDP && udp_sock >= 0);
+        if (can_start) {
+            sending = true;
+            ESP_LOGI(TAG1, "START recibido: comenzando transmisión de datos en modo %s", 
+                     (current_mode == MODE_TCP ? "TCP" : "UDP"));
+            send_all("STARTED\n", strlen("STARTED\n"));
+        } else {
+            send_all("START_ERR_NOT_READY\n", strlen("START_ERR_NOT_READY\n"));
+        }
     } else if (strcmp(cmd, "STOP") == 0) {
         sending = false;
-        ESP_LOGI(TAG1, "STOP recibido: deteniendo transmisión de datos (pero manteniendo conexión)");
+        ESP_LOGI(TAG1, "STOP recibido: deteniendo transmisión de datos");
         send_all("STOPPED\n", strlen("STOPPED\n"));
     } else if (strcmp(cmd, "PING") == 0) {
         send_all("PONG\n", strlen("PONG\n"));
     }
     else if (strcmp(cmd, "TCP") == 0) {
-    ESP_LOGW(TAG1, "Cambiando a modo TCP...");
-    current_mode = MODE_TCP;
-    sending = false;  // detén transmisión hasta nuevo START
-    send_all("SWITCHED_TO_TCP\n", strlen("SWITCHED_TO_TCP\n"));
+        if (current_mode != MODE_TCP) {
+            ESP_LOGW(TAG1, "Cambiando a modo TCP...");
+            current_mode = MODE_TCP;
+            sending = false;  // detén transmisión hasta que TCP se conecte y reciba nuevo START
+        }
+        send_all("SWITCHED_TO_TCP\n", strlen("SWITCHED_TO_TCP\n"));
     }
     else if (strcmp(cmd, "UDP") == 0) {
-        ESP_LOGW(TAG1, "Cambiando a modo UDP...");
-        current_mode = MODE_UDP;
-        sending = false;
-        // cerrar TCP
-        xSemaphoreTake(sock_mutex, portMAX_DELAY);
-        if (sockfd >= 0) close(sockfd);
-        sockfd = -1;
-        tcp_connected = false;
-        xSemaphoreGive(sock_mutex);
+        if (current_mode != MODE_UDP) {
+            ESP_LOGW(TAG1, "Cambiando a modo UDP...");
+            current_mode = MODE_UDP;
+            sending = false;
+            // No cerramos el socket TCP aquí, lo hace connection_handler_task al romper el loop recv
+        }
+        send_all("SWITCHED_TO_UDP\n", strlen("SWITCHED_TO_UDP\n"));
     } else {
     ESP_LOGI(TAG1, "Comando desconocido: %s", cmd);
     send_all("UNK_CMD\n", strlen("UNK_CMD\n"));
     }
-
 }
 
 // -----------------------------------------------------------------------------
-// Tarea de sensor: lee, arma JSON y envía cuando sending==true y tcp_connected==true
+// Tarea de sensor: lee, arma JSON y envía
 static void sensor_task(void *arg)
 {
-    // Si necesitas inicializar BMI aquí, hacerlo (bmi_init ya en app_main)
-    // se hará muestreo en bucle; intervalo entre muestras = 1/Fodr segundos
     while (1) {
-        if (!tcp_connected) {
-            // no hay conexión: esperar y luego reintentar sin reiniciar
-            ESP_LOGI(TAG1, "Sensor: sin conexión TCP, esperando reconexión...");
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
+        
+        // 1. Verificar si hay un canal activo y si se debe enviar
+        bool can_send = false;
+        if (current_mode == MODE_TCP) {
+            can_send = tcp_connected;
+        } else if (current_mode == MODE_UDP) {
+            can_send = (udp_sock >= 0);
         }
-
-        if (!sending) {
-            // Conectado pero no enviando
+        
+        if (!sending || !can_send) {
+            // No estamos enviando o no hay canal disponible, esperar
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
-        // Cuando sending==true y tcp_connected==true -> tomar una muestra
-        // leer datos del BMI (usar tu función lectura simplificada)
-        // Leemos registros de datos crudos (asumiendo que reg_data = 0x0C y 12 bytes)
-        uint8_t reg_data = 0x0C;
+        // 2. Leer datos del BMI
+        uint8_t reg_data = 0x0C; // Dirección de registro de datos crudos
         uint8_t data_data8[12];
         esp_err_t r = bmi_read(&reg_data, data_data8, 12);
         if (r != ESP_OK) {
             ESP_LOGW(TAG1, "Error leyendo BMI: %s", esp_err_to_name(r));
-            // si error en lectura, esperar y seguir
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        // convertir a signed 16 bit
+        // 3. Procesar datos
         int16_t acc_x = (int16_t)((data_data8[1] << 8) | data_data8[0]);
         int16_t acc_y = (int16_t)((data_data8[3] << 8) | data_data8[2]);
         int16_t acc_z = (int16_t)((data_data8[5] << 8) | data_data8[4]);
@@ -499,9 +358,9 @@ static void sensor_task(void *arg)
         int64_t t_us = esp_timer_get_time(); // microsegundos
         int64_t t_ms = t_us / 1000;
 
-        // Generar JSON (una línea por muestra)
+        // 4. Generar JSON y enviar
         char outbuf[256];
-        int n = snprintf(outbuf, sizeof(outbuf),
+        int n = snprintf(outbuf, sizeof(outbuf), // <<< CORRECCIÓN: 'n' declarada aquí
             "{\"ts_ms\":%" PRId64 ",\"acc_m_s2\":[%.5f,%.5f,%.5f],\"acc_g\":[%.5f,%.5f,%.5f],\"gyr_rad_s\":[%.5f,%.5f,%.5f],\"fs_hz\":%u}\n",
             t_ms,
             acc_x * acc_scale_ms2, acc_y * acc_scale_ms2, acc_z * acc_scale_ms2,
@@ -510,23 +369,25 @@ static void sensor_task(void *arg)
             (unsigned)Fodr
         );
 
-        // enviar por TCP
-        if (send_all(outbuf, n) != ESP_OK) {
-            ESP_LOGW(TAG1, "Falló envío de muestra, marcando como desconectado");
-            // forzar cierre de socket para que task de tcp_client reintente
-            xSemaphoreTake(sock_mutex, portMAX_DELAY);
-            if (sockfd >= 0) close(sockfd);
-            sockfd = -1;
-            tcp_connected = false;
-            xSemaphoreGive(sock_mutex);
-            sending = false; // detener hasta reconexión y nuevo START
-            continue;
+        if (n > 0 && send_all(outbuf, n) != ESP_OK) {
+            ESP_LOGW(TAG1, "Falló envío de muestra en modo %s.",
+                     (current_mode == MODE_TCP ? "TCP" : "UDP"));
+            
+            // Si falla el envío TCP, forzar la desconexión para reintento
+            if (current_mode == MODE_TCP) {
+                xSemaphoreTake(sock_mutex, portMAX_DELAY);
+                if (sockfd >= 0) close(sockfd);
+                sockfd = -1;
+                tcp_connected = false;
+                xSemaphoreGive(sock_mutex);
+                sending = false; // detener hasta reconexión y nuevo START
+            }
         } else {
-            // informe de envío correcto (puedes moderar la verbosidad)
-            ESP_LOGI(TAG1, "Muestra enviada ts=%" PRId64, t_ms);
+            ESP_LOGI(TAG1, "Muestra enviada ts=%" PRId64 " via %s", t_ms, 
+                     (current_mode == MODE_TCP ? "TCP" : "UDP"));
         }
 
-        // esperar intervalo según Fodr
+        // 5. Esperar intervalo según Fodr
         if (Fodr > 0) {
             uint32_t wait_ms = 1000 / Fodr;
             if (wait_ms == 0) wait_ms = 1; // mínimo 1ms
@@ -543,33 +404,19 @@ void app_main(void)
 {
     ESP_LOGI(TAG1, "Iniciando...");
 
-    // mutex para proteger sockfd
+    // Mutex para proteger sockfd y tcp_connected
     sock_mutex = xSemaphoreCreateMutex();
 
     // Inicializar WiFi
     ESP_ERROR_CHECK(wifi_init_sta());
 
-    // Inicializar BMI (usa tu bmi_init)
-    bmi_sensor_init();
-    // Aquí asumo que haces softreset, chipid, initialization, etc.
-    // Llamar a tus funciones si están disponibles externamente:
-    // softreset(); chipid(); initialization(); check_initialization(); bmipowermode(); internal_status();
-    // Para este ejemplo: asumo que tu código ya las llama o puedes llamarlas aquí.
+    // Inicializar BMI
+    bmi_sensor_init(); // Asumo tu función de inicialización del BMI270
 
     current_mode = MODE_TCP;
 
-    while (1) {
-        if (current_mode == MODE_TCP) {
-            start_tcp_mode();   // Se queda bloqueado hasta recibir "UDP"
-        } else {
-            start_udp_mode();   // Se queda bloqueado hasta recibir "TCP"
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
     // Crear tareas
-    xTaskCreate(tcp_client_task, "tcp_client_task", 8 * 1024, NULL, 5, NULL);
+    xTaskCreate(connection_handler_task, "conn_handler_task", 8 * 1024, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor_task", 8 * 1024, NULL, 6, NULL);
 
     ESP_LOGI(TAG1, "Tareas creadas.");
