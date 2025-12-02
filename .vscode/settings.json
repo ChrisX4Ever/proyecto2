@@ -20,6 +20,7 @@
   "files.associations": {
     "i2c_master.h": "c",
     "freertos.h": "c",
-    "esp_event.h": "c"
+    "esp_event.h": "c",
+    "bmi270.h": "c"
   }
 }
