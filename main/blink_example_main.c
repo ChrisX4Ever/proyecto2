@@ -52,9 +52,15 @@ extern esp_err_t bmi_init(void);
 extern void bmi_sensor_init(void); // Asumo que esta llama a bmi_init() y setup
 
 // --- Configuración WiFi / Server ---
-#define WIFI_SSID       "Sala de Estudios DIE"
-#define WIFI_PASS       "SE.die2025"
-#define SERVER_IP       "192.168.50.81"   // IP de la Raspberry Pi (ajusta)
+//#define WIFI_SSID       "Sala de Estudios DIE"
+#define WIFI_SSID       "JVidal"
+//#define WIFI_SSID       "LAB.SISTEMAS DE COMUNICACIONES"
+//#define WIFI_PASS       "SE.die2025"
+//#define WIFI_PASS       "Comunicaciones"
+#define WIFI_PASS       "v1d1ls1lv1"
+//#define SERVER_IP       "192.168.50.81"   // IP de la Raspberry Pi (ajusta)
+#define SERVER_IP       "192.168.4.183"   // IP de la Raspberry Pi (ajusta)
+//#define SERVER_IP       "192.168.0.207"   // IP de la Raspberry Pi (ajusta)
 #define TCP_PORT        1111              // Puerto TCP
 #define UDP_PORT        3333              // Puerto UDP
 
@@ -312,6 +318,96 @@ static void handle_command(const char *cmd)
 }
 
 // -----------------------------------------------------------------------------
+// Tarea de envío de datos (data_sender_task) - COMPLETO Y CORREGIDO
+// -----------------------------------------------------------------------------
+void data_sender_task(void *pvParameter)
+{
+    // Variables de escala (declaradas una sola vez fuera del loop)
+    const float acc_scale_ms2 = 78.4532f / 32768.0f; // m/s2 per bit
+    const float acc_scale_g = 8.0f / 32768.0f;       // g per bit
+    const float gyr_scale = 34.90659f / 32768.0f;    // rad/s per bit
+    
+    while (1) {
+        
+        // 1. Verificar si hay un canal activo y si se debe enviar
+        bool can_send = false; // <--- Declaración de can_send
+        if (current_mode == MODE_TCP) {
+            can_send = tcp_connected;
+        } else if (current_mode == MODE_UDP) {
+            can_send = (udp_sock >= 0);
+        }
+        
+        if (!sending || !can_send) {
+            // No estamos enviando o no hay canal disponible, esperar
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        // 2. Leer datos del BMI
+        uint8_t reg_data = 0x0C; // Dirección de registro de datos crudos
+        uint8_t data_data8[12];
+        esp_err_t r = bmi_read(&reg_data, data_data8, 12);
+        if (r != ESP_OK) {
+            ESP_LOGW(TAG1, "Error leyendo BMI: %s", esp_err_to_name(r));
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // 3. Procesar datos
+        int16_t acc_x = (int16_t)((data_data8[1] << 8) | data_data8[0]);
+        int16_t acc_y = (int16_t)((data_data8[3] << 8) | data_data8[2]);
+        int16_t acc_z = (int16_t)((data_data8[5] << 8) | data_data8[4]);
+        int16_t gyr_x = (int16_t)((data_data8[7] << 8) | data_data8[6]);
+        int16_t gyr_y = (int16_t)((data_data8[9] << 8) | data_data8[8]);
+        int16_t gyr_z = (int16_t)((data_data8[11] << 8) | data_data8[10]);
+
+        // timestamp ms
+        int64_t t_us = esp_timer_get_time(); // microsegundos
+        int64_t t_ms = t_us / 1000;          // <--- Declaración de t_ms
+
+        // 4. Generar JSON y enviar
+        char outbuf[256]; // <--- Declaración de outbuf
+        
+        // snprintf corregido (uso de PRId64, formato de flotantes y enteros)
+        int n = snprintf(outbuf, sizeof(outbuf), 
+            "{\"ts_ms\":%" PRId64 ",\"acc_m_s2\":[%.5f,%.5f,%.5f],\"acc_g\":[%.5f,%.5f,%.5f],\"gyr_rad_s\":[%.5f,%.5f,%.5f],\"fs_hz\":%u}\n",
+            t_ms,
+            acc_x * acc_scale_ms2, acc_y * acc_scale_ms2, acc_z * acc_scale_ms2,
+            acc_x * acc_scale_g, acc_y * acc_scale_g, acc_z * acc_scale_g,
+            gyr_x * gyr_scale, gyr_y * gyr_scale, gyr_z * gyr_scale,
+            (unsigned)Fodr
+        );
+
+        if (n > 0 && send_all(outbuf, n) != ESP_OK) {
+            ESP_LOGW(TAG1, "Falló envío de muestra en modo %s.",
+                     (current_mode == MODE_TCP ? "TCP" : "UDP"));
+            
+            // Si falla el envío TCP, forzar la desconexión para reintento
+            if (current_mode == MODE_TCP) {
+                xSemaphoreTake(sock_mutex, portMAX_DELAY);
+                if (sockfd >= 0) close(sockfd);
+                sockfd = -1;
+                tcp_connected = false;
+                xSemaphoreGive(sock_mutex);
+                sending = false; // detener hasta reconexión y nuevo START
+            }
+        } else {
+            ESP_LOGI(TAG1, "Muestra enviada ts=%" PRId64 " via %s", t_ms, 
+                     (current_mode == MODE_TCP ? "TCP" : "UDP"));
+        }
+
+        // 5. Esperar intervalo según Fodr
+        if (Fodr > 0) {
+            uint32_t wait_ms = 1000 / Fodr;
+            if (wait_ms == 0) wait_ms = 1; // mínimo 1ms
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tarea de sensor: lee, arma JSON y envía
 static void sensor_task(void *arg)
 {
@@ -360,15 +456,25 @@ static void sensor_task(void *arg)
 
         // 4. Generar JSON y enviar
         char outbuf[256];
-        int n = snprintf(outbuf, sizeof(outbuf), // <<< CORRECCIÓN: 'n' declarada aquí
+        int n = snprintf(outbuf, sizeof(outbuf), 
+            // CORRECCIÓN: El '%' debe ir ANTES de la macro PRId64 para asegurar la sintaxis
+            // y corregir el desajuste de argumentos.
             "{\"ts_ms\":%" PRId64 ",\"acc_m_s2\":[%.5f,%.5f,%.5f],\"acc_g\":[%.5f,%.5f,%.5f],\"gyr_rad_s\":[%.5f,%.5f,%.5f],\"fs_hz\":%u}\n",
-            t_ms,
-            acc_x * acc_scale_ms2, acc_y * acc_scale_ms2, acc_z * acc_scale_ms2,
+            // ----------------------------------------------------------------------------------------------------------------------------------
+            
+            // ARGUMENTO 1 (para PRId64)
+            t_ms, 
+            
+            // ARGUMENTO 2 (para el primer %.5f)
+            acc_x * acc_scale_ms2, 
+            
+            // El resto de los argumentos siguen en orden
+            acc_y * acc_scale_ms2, acc_z * acc_scale_ms2,
             acc_x * acc_scale_g, acc_y * acc_scale_g, acc_z * acc_scale_g,
             gyr_x * gyr_scale, gyr_y * gyr_scale, gyr_z * gyr_scale,
-            (unsigned)Fodr
+            (unsigned)Fodr // ARGUMENTO 10 (para %u)
         );
-
+        
         if (n > 0 && send_all(outbuf, n) != ESP_OK) {
             ESP_LOGW(TAG1, "Falló envío de muestra en modo %s.",
                      (current_mode == MODE_TCP ? "TCP" : "UDP"));
@@ -418,6 +524,7 @@ void app_main(void)
     // Crear tareas
     xTaskCreate(connection_handler_task, "conn_handler_task", 8 * 1024, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor_task", 8 * 1024, NULL, 6, NULL);
+    xTaskCreate(data_sender_task, "data_sender", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG1, "Tareas creadas.");
 }
