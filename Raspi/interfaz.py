@@ -13,14 +13,12 @@ import pyqtgraph as pg
 from scipy.signal import find_peaks
 
 # ================= CONFIGURACIÓN DE RED =================
-# "0.0.0.0" permite escuchar en TODAS las interfaces de red de la Raspberry Pi
-# Esto soluciona problemas si la IP de la Pi cambia.
+# Escuchar en todas las interfaces (0.0.0.0) para evitar problemas si la IP de la Pi cambia
 Host_Listening = "0.0.0.0" 
 PORT_TCP = 1111
 PORT_UDP = 3333
 
-# ¡IMPORTANTE!: Asegúrate de que esta sea la IP ACTUAL de la ESP32
-# Puedes verla en el monitor serial de la ESP32 al conectarse al WiFi.
+# ¡IMPORTANTE!: AJUSTA ESTA IP A LA DE TU ESP32 ACTUAL
 ESP32_IP = "192.168.5.31" 
 
 # =======================================================
@@ -44,8 +42,7 @@ class TCPServerThread(QThread):
             self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            # Nota: Al usar 0.0.0.0, escuchamos en todas las IPs locales
-            print(f"Servidor TCP escuchando en puerto {self.port}")
+            print(f"Servidor TCP iniciado en puerto {self.port}")
             self.server_sock.bind((self.host, self.port))
             self.server_sock.listen(1)
             self.connection_status.emit(f"Esperando ESP32 en puerto {self.port}...")
@@ -111,7 +108,7 @@ class TCPServerThread(QThread):
         self.wait() 
 
 # =======================================================
-#   HILO UDP (RECEPCIÓN) - ROBUSTO
+#   HILO UDP (RECEPCIÓN)
 # =======================================================
 class UDPReceiverThread(QThread):
     data_received = Signal(str)
@@ -127,7 +124,6 @@ class UDPReceiverThread(QThread):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Bind a 0.0.0.0 asegura recibir paquetes sin importar la IP destino exacta
             self.sock.bind((self.host, self.port))
             print(f"UDP Receptor iniciado en puerto {self.port}")
             self.sock.settimeout(0.5) 
@@ -135,12 +131,6 @@ class UDPReceiverThread(QThread):
             while self.running:
                 try:
                     data, addr = self.sock.recvfrom(2048) 
-                    
-                    # --- DEBUG VISUAL: Ver si llegan datos crudos ---
-                    # Descomenta esto si la gráfica sigue vacía
-                    # print(f"[UDP RX] {len(data)} bytes de {addr}")
-                    # ------------------------------------------------
-                    
                     payload = data.decode("utf-8", errors="ignore") 
                     self.data_received.emit(payload)
                 except socket.timeout:
@@ -161,7 +151,7 @@ class UDPReceiverThread(QThread):
         self.wait()
 
 # =======================================================
-#   PROCESAMIENTO DE DATOS
+#   PROCESAMIENTO DE DATOS (Soporte BMI + BME)
 # =======================================================
 class DataProcessor:
     def __init__(self):
@@ -176,33 +166,44 @@ class DataProcessor:
             return None, None 
 
         val = 0.0
-        sensor_key = ""
-        idx = 0
-
         sel_sensor = config["sensor"] 
         sel_axis = config["param_type"] 
 
-        if sel_sensor == "acelerometro": sensor_key = "acc_m_s2"
-        elif sel_sensor == "giroscopio": sensor_key = "gyr_rad_s"
-        
-        if "x" in sel_axis: idx = 0
-        elif "y" in sel_axis: idx = 1
-        elif "z" in sel_axis: idx = 2
-
-        if sensor_key in record:
-            try:
-                val = float(record[sensor_key][idx])
-            except (IndexError, ValueError):
+        # --- LÓGICA DE SELECCIÓN DE SENSOR ---
+        if sel_sensor == "temperatura":
+            # BME688: Valor escalar único
+            if "temp_c" in record:
+                val = float(record["temp_c"])
+            else:
                 return None, None
         else:
-            return None, None
+            # BMI270: Valor vectorial [x,y,z]
+            sensor_key = ""
+            idx = 0
+            
+            if sel_sensor == "acelerometro": sensor_key = "acc_m_s2"
+            elif sel_sensor == "giroscopio": sensor_key = "gyr_rad_s"
+            
+            if "x" in sel_axis: idx = 0
+            elif "y" in sel_axis: idx = 1
+            elif "z" in sel_axis: idx = 2
 
+            if sensor_key in record:
+                try:
+                    val = float(record[sensor_key][idx])
+                except (IndexError, ValueError):
+                    return None, None
+            else:
+                return None, None
+
+        # --- Buffer Circular ---
         self.signal_buffer_x = np.append(self.signal_buffer_x, val)
         if len(self.signal_buffer_x) > self.signal_buffer_size:
             self.signal_buffer_x = self.signal_buffer_x[-self.signal_buffer_size:]
             
         current_signal = self.signal_buffer_x.copy()
 
+        # --- Procesamiento FFT / RMS ---
         if config["output_type"] == "Procesado":
             if 'rms_window' in config and config['rms_window'] > 0:
                 window = current_signal[-config['rms_window']:]
@@ -280,7 +281,9 @@ class MainWindow(QMainWindow):
         
         control_layout.addWidget(QLabel("Sensor:"))
         self.sensor_select = QComboBox()
-        self.sensor_select.addItems(["acelerometro", "giroscopio"])
+        # AÑADIDO: Opción "temperatura" para BME688
+        self.sensor_select.addItems(["acelerometro", "giroscopio", "temperatura"])
+        self.sensor_select.currentIndexChanged.connect(self.reset_graph_data)
         control_layout.addWidget(self.sensor_select)
         
         control_layout.addWidget(QLabel("Eje:"))
@@ -344,8 +347,26 @@ class MainWindow(QMainWindow):
             "fft_peaks": self.fft_peaks_checkbox.isChecked()
         }
         
-    # --- LÓGICA DE CONEXIÓN Y MODOS ---
+    def reset_graph_data(self):
+        """ Limpia gráfica y actualiza etiquetas según el sensor """
+        self.time_data.clear()
+        self.value_data.clear()
+        self.plot_curve.setData([])
+        
+        sensor = self.sensor_select.currentText()
+        if sensor == "temperatura":
+            self.graph.setLabel("left", "Temperatura (°C)")
+            self.type_select.setEnabled(False)
+        else:
+            self.type_select.setEnabled(True)
+            if sensor == "acelerometro":
+                self.graph.setLabel("left", "Aceleración (m/s²)")
+            elif sensor == "giroscopio":
+                self.graph.setLabel("left", "Vel. Angular (rad/s)")
 
+    # ======================================================
+    #   GESTIÓN DE RED
+    # ======================================================
     def start_udp_listener(self):
         if self.udp_thread is None:
             self.udp_thread = UDPReceiverThread(Host_Listening, PORT_UDP)
@@ -357,40 +378,59 @@ class MainWindow(QMainWindow):
         if self.udp_thread:
             self.udp_thread.stop()
             self.udp_thread = None
-            self.update_status_label("Modo TCP. Esperando datos.")
+            # No cambiamos status aquí porque puede que estemos pasando a TCP
+
+    def force_start_tcp_server(self):
+        print("[GUI] Forzando reinicio del Servidor TCP...")
+        if self.server_thread:
+            self.server_thread.stop()
+            self.server_thread = None
+        self.active_client_sock = None
+        
+        self.server_thread = TCPServerThread(Host_Listening, PORT_TCP)
+        self.server_thread.data_received.connect(self.on_data_received)
+        self.server_thread.connection_status.connect(self.update_status_label)
+        self.server_thread.client_socket_ready.connect(self.set_active_socket)
+        self.server_thread.start()
+        
+        self.btn_connect.setText("Detener Conexión")
+        self.update_status_label("Esperando reconexión TCP...")
 
     # ======================================================
-    #   FUNCIÓN DE CAMBIO DE MODO - CORREGIDA (UDP -> TCP)
+    #   CAMBIO DE MODO ROBUSTO (TCP <-> UDP)
     # ======================================================
     def request_mode_change(self):
         mode_command = self.mode_select.currentText()
         
         if mode_command == "TCP":
-            # 1. Enviar comando "TCP" a la ESP32 (viajará por UDP)
-            # La ESP32 recibirá esto, cerrará UDP y empezará a buscar el servidor TCP
+            # 1. Avisar a ESP32
             self.send_control_command("TCP")
             
-            # 2. Detener la escucha UDP local inmediatamente
+            # 2. Cerrar UDP local
             self.stop_udp_listener() 
             
-            # 3. Dar un pequeño tiempo para que el puerto se libere y la ESP procese
-            time.sleep(0.5) 
-            
-            # 4. FORZAR el inicio del servidor TCP
+            # 3. Forzar apertura de TCP Server para recibir la reconexión
+            time.sleep(0.5)
             self.force_start_tcp_server()
             
         elif mode_command == "UDP":
-            # (Esta parte UDP ya funcionaba, la dejamos igual)
+            # 1. Avisar a ESP32
             self.send_control_command("UDP")
+            
+            # 2. Limpiar referencia a TCP
             self.active_client_sock = None 
             time.sleep(0.1) 
+            
+            # 3. Abrir UDP local
             self.start_udp_listener() 
             
+            # 4. Cerrar TCP server local
             if self.server_thread and self.server_thread.isRunning(): 
                 self.server_thread.stop()
                 self.server_thread = None
-            
-            self.send_control_command("START")
+        
+            # 5. Enviar START por UDP
+            self.send_control_command("START") 
 
     def toggle_server(self):
         is_running = self.server_thread is not None or self.udp_thread is not None
@@ -407,9 +447,7 @@ class MainWindow(QMainWindow):
             self.server_thread.start()
 
             self.btn_connect.setText("Detener Conexión")
-            self.time_data.clear()
-            self.value_data.clear()
-            self.plot_curve.setData([])
+            self.reset_graph_data()
             
         else:
             if self.server_thread:
@@ -421,45 +459,14 @@ class MainWindow(QMainWindow):
             self.btn_connect.setText("Iniciar Servidor (Esperar ESP32)")
             self.lbl_status.setText("Estado: Detenido")
 
-    # ======================================================
-    #   FUNCIÓN AUXILIAR: FORZAR INICIO DE SERVIDOR TCP
-    # ======================================================
-    def force_start_tcp_server(self):
-        print("[GUI] Forzando inicio del Servidor TCP...")
-        
-        # 1. Limpieza preventiva
-        if self.server_thread:
-            self.server_thread.stop()
-            self.server_thread = None
-        
-        self.active_client_sock = None
-        
-        # 2. Configuración e inicio
-        self.server_thread = TCPServerThread(Host_Listening, PORT_TCP)
-        self.server_thread.data_received.connect(self.on_data_received)
-        self.server_thread.connection_status.connect(self.update_status_label)
-        self.server_thread.client_socket_ready.connect(self.set_active_socket)
-        self.server_thread.start()
-
-        # 3. Actualizar GUI
-        self.btn_connect.setText("Detener Conexión")
-        self.update_status_label("Esperando reconexión TCP de la ESP32...")
-
-    # ======================================================
-    #   SLOT: SE ACTIVA CUANDO ESP32 SE CONECTA POR TCP
-    # ======================================================
     @Slot(object)
     def set_active_socket(self, sock):
         self.active_client_sock = sock
-        
         if sock:
             print(f"[GUI] Socket TCP conectado. ESP32 re-conectada.")
             self.update_status_label("Conectado por TCP.")
-            
-            # ESPERAR Y ENVIAR START
-            # Esto es lo que 'despierta' a la ESP32 en modo TCP
+            # AUTO-START: Enviar START automáticamente al reconectar por TCP
             QTimer.singleShot(500, lambda: self.send_control_command("START"))
-            
         else:
             print(f"[GUI] Socket cliente TCP limpiado.")
 
@@ -499,8 +506,8 @@ class MainWindow(QMainWindow):
                 print(f"Fallo envío TCP: {e}. Intentando UDP...")
                 self.active_client_sock = None 
 
-        # Fallback a UDP para START/STOP
-        if (cmd == "START" or cmd == "STOP" or cmd == "TCP" or cmd == "UDP"):
+        # Fallback a UDP para START/STOP/MODOS
+        if cmd in ["START", "STOP", "TCP", "UDP"]:
             try:
                 send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 esp_addr = (ESP32_IP, PORT_UDP) 
