@@ -28,4 +28,4 @@
 23) En la interfaz, seleccionar "_Iniciar Servidor (ESP32)_", eso conectará la ESP32 con la Raspberry Pi mediante el protocolo TCP
 24) Seleccionar TCP o UDP para el modo de transmisión de datos, Acelerómetro o Temperatura para utilizar el acelerómetro del sensor BMI270 o el sensor de temperatura del sensor BME688
 
-    NOTA: Si al seleccionar el modo UDP no se visualizan cambios en el gráfico, abrir una terminal en la Raspberry Pi y escribir "__" seguido de "__". Eso logrará que el modo UDP grafique los datos
+    NOTA: Si al seleccionar el modo UDP no se visualizan cambios en el gráfico, abrir una terminal en la Raspberry Pi y escribir "_sudo ufw allow 3333/udp_" seguido de "_sudo ufw reload_". Eso logrará que el modo UDP grafique los datos
